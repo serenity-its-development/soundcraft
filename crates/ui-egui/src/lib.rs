@@ -1,4 +1,4 @@
-//! SoundCraft's egui user interface.
+//! Sound's egui user interface.
 //!
 //! The UI is a thin shell over [`soundcraft_engine::Engine`]: it draws engine state and acts by
 //! executing commands. It can be replaced without touching anything below it.
@@ -191,6 +191,9 @@ impl Default for UiState {
     }
 }
 
+/// A host's answer to a command before the editor runs it: `Some(result)` when the host did it, `None` to let the editor run it.
+pub type HostRun = Box<dyn FnMut(&mut SoundApp, &str, &Value) -> Option<Result<Value, String>>>;
+
 /// Host services (file dialogs) injected by the app; absent in tests and on the web.
 #[derive(Default)]
 pub struct Services {
@@ -269,6 +272,9 @@ pub struct SoundApp {
     pub ui: UiState,
     pub audio_health_report: Option<Result<Value, String>>,
     pub services: Services,
+    /// A host that keeps the file it opened (OneOS): asked first about every command, it may answer one itself (Save writes the
+    /// opened file back through the host, not a path prompt). `None` answers nothing. Set by the web shell when framed.
+    pub host_run: Option<HostRun>,
     /// Set only by a desktop host after installing an OS menu bar.
     pub native_menu_bar: bool,
     /// Folder for crash-recovery autosaves (native apps set it).
@@ -395,6 +401,7 @@ impl SoundApp {
             ui: UiState::default(),
             audio_health_report: None,
             services,
+            host_run: None,
             native_menu_bar: false,
             autosave_dir: None,
             autosaver: None,
@@ -453,6 +460,16 @@ impl SoundApp {
 
     /// Run a command; errors go to the status line. Returns the result.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        if let Some(mut host) = self.host_run.take() {
+            let answered = host(self, id, &params);
+            self.host_run = Some(host);
+            if let Some(r) = answered {
+                if let Err(e) = &r {
+                    self.ui.status = e.clone();
+                }
+                return r;
+            }
+        }
         if matches!(id, "session.new" | "session.open" | "session.close" | "session.revert") && bounce::refuses_session_switch(self) {
             return Err(self.ui.status.clone());
         }
@@ -795,7 +812,7 @@ impl SoundApp {
     }
 
     /// Done with the open session. Unsaved changes stay in its autosave folder for the next
-    /// launch, unless the user quit with SoundCraft's Quit; a take still recording is finished
+    /// launch, unless the user quit with Sound's Quit; a take still recording is finished
     /// and always stays.
     pub fn close_autosave(&mut self) {
         let recording = self.engine.transport.recording;
@@ -822,9 +839,9 @@ impl SoundApp {
         self.panic_rev = self.engine.revision;
         let saved = self.engine.is_dirty() && self.write_autosave();
         self.ui.status = if saved {
-            "SoundCraft hit an internal error (see the log). Your changes were autosaved: save them, then restart SoundCraft.".into()
+            "Sound hit an internal error (see the log). Your changes were autosaved: save them, then restart Sound.".into()
         } else {
-            "SoundCraft hit an internal error (see the log). Restart SoundCraft to be safe.".into()
+            "Sound hit an internal error (see the log). Restart Sound to be safe.".into()
         };
     }
 
@@ -925,7 +942,7 @@ impl SoundApp {
         let (cause, then) = match trouble {
             OutputTrouble::Bug => (
                 "the audio engine hit an internal error (see the log)".to_string(),
-                "Use Reconnect audio device in Setup ▸ Playback Engine, or restart SoundCraft.",
+                "Use Reconnect audio device in Setup ▸ Playback Engine, or restart Sound.",
             ),
             OutputTrouble::Gone => {
                 (format!("“{name}” was disconnected"), "Plug it back in, then use Reconnect audio device in Setup ▸ Playback Engine.")

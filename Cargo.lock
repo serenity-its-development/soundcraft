@@ -3717,6 +3717,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "soundcraft-host-node"
+version = "0.12.1"
+dependencies = [
+ "serde_json",
+ "soundcraft-engine",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "soundcraft-midi"
 version = "0.12.1"
 dependencies = [

@@ -13,6 +13,8 @@ pub mod cmd;
 pub mod demo;
 pub mod edit;
 pub mod file_access;
+pub mod host_commands;
+pub mod host_open;
 pub mod inspect;
 pub mod io;
 pub mod score;
@@ -631,3 +633,5 @@ mod panic_tests {
         assert_eq!(e.last_selection, selection);
     }
 }
+#[cfg(test)]
+mod host_commands_tests;

@@ -81,3 +81,12 @@ opt-level = 3
 lto = "thin"
 codegen-units = 16
 debug = 0
+
+# The size profile of the OneOS web build (opt-level z, fat LTO, panic abort): the upstream release build is far over the 25 MiB a static asset may be.
+[profile.web-release]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+panic = "abort"
+codegen-units = 1
+debug = 0

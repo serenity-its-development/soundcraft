@@ -14,8 +14,18 @@ const LOADING_ID: &str = "soundcraft_loading";
 
 pub fn start() {
     eframe::WebLogger::init(log::LevelFilter::Info).ok();
-    io::set_deliver(download);
-    wasm_bindgen_futures::spawn_local(async {
+    // Framed by OneOS (the frame page declared the ONE parent origin): the parent opens the file in it and stores what it saves.
+    // Otherwise every save and export reaches the person as a browser download.
+    let bridge = crate::host::Bridge::new();
+    match &bridge {
+        Some(bridge) => {
+            bridge.install();
+            io::set_deliver(crate::host::deliver);
+        }
+        None => io::set_deliver(download),
+    }
+    let app_bridge = bridge.clone();
+    wasm_bindgen_futures::spawn_local(async move {
         let Some(document) = web_sys::window().and_then(|w| w.document()) else {
             log::error!("no document");
             return;
@@ -38,17 +48,31 @@ pub fn start() {
                     if let Some(rs) = &cc.wgpu_render_state {
                         log::info!("soundcraft-web: wgpu backend {:?}", rs.adapter.get_info().backend);
                     }
-                    let engine = if query().contains("empty") { Engine::default() } else { soundcraft_engine::demo::demo_engine() };
+                    // Framed, the host sends the file: start on an empty session, not the demo.
+                    let engine = if query().contains("empty") || app_bridge.is_some() { Engine::default() } else { soundcraft_engine::demo::demo_engine() };
                     let player = soundcraft_playback::Player::new(Arc::new(engine.session().clone()));
-                    let app = SoundApp::new(engine, Some(player), Services::default());
-                    Ok(Box::new(WebShell { app, inbox: Rc::default(), samples: Rc::default() }))
+                    let mut app = SoundApp::new(engine, Some(player), Services::default());
+                    let hosted = app_bridge.map(|bridge| {
+                        let runs = crate::host::Runs::default();
+                        let opens = crate::host::Opens::default();
+                        let notices = Rc::new(RefCell::new(Vec::new()));
+                        bridge.listen(opens.clone(), runs.clone(), notices.clone(), cc.egui_ctx.clone());
+                        let file: Rc<RefCell<Option<HostFile>>> = Rc::default();
+                        app.host_run = Some(save_through_host(file.clone()));
+                        bridge.post_ready();
+                        Hosted { bridge, reported: crate::host::DirtyReport::default(), runs, opens, notices, file, handoff: crate::handoff::Handoff::new(), serial: 0 }
+                    });
+                    Ok(Box::new(WebShell { app, inbox: Rc::default(), samples: Rc::default(), hosted }))
                 }),
             )
             .await;
+        if let (Err(e), Some(bridge)) = (&result, &bridge) {
+            bridge.post_failed(&format!("{e:?}"));
+        }
         if let Some(el) = document.get_element_by_id(LOADING_ID) {
             match result {
                 Ok(()) => el.remove(),
-                Err(e) => el.set_inner_html(&format!("<p>SoundCraft failed to start: {e:?}</p><p>A browser with WebGPU or WebGL2 is required.</p>")),
+                Err(e) => el.set_inner_html(&format!("<p>Sound failed to start: {e:?}</p><p>A browser with WebGPU or WebGL2 is required.</p>")),
             }
         }
     });
@@ -96,7 +120,7 @@ impl Purpose {
 
     fn filter(self) -> (&'static str, &'static [&'static str]) {
         match self {
-            Self::Session => ("SoundCraft Session", SESSION_EXTS),
+            Self::Session => ("Sound Session", SESSION_EXTS),
             Self::Audio => ("Audio", AUDIO_EXTS),
             Self::Midi => ("MIDI", MIDI_EXTS),
         }
@@ -115,6 +139,96 @@ struct WebShell {
     app: SoundApp,
     inbox: Inbox,
     samples: SampleInbox,
+    hosted: Option<Hosted>,
+}
+
+/// How the file the host opened is written back.
+#[derive(Clone)]
+enum HostKind {
+    /// A Sound session bundle (`.scraftz`): Save writes the bundle.
+    Session,
+    /// An audio file (WAV, AIFF or FLAC): Save writes the main mix in the file's own format and bit depth.
+    Audio { format: &'static str, bit_depth: &'static str },
+}
+
+/// The file the host opened: its name (a save under it is a new version of it) and how it is written back.
+#[derive(Clone)]
+struct HostFile {
+    name: String,
+    kind: HostKind,
+}
+
+/// What OneOS framing adds: the bridge, the dirty state last reported, the assistant's runs, the files and notices waiting for the next
+/// frame, the file the host opened, and the progressive open's hand-over (keyed by how many files were opened).
+struct Hosted {
+    bridge: crate::host::Bridge,
+    reported: crate::host::DirtyReport,
+    runs: crate::host::Runs,
+    opens: crate::host::Opens,
+    notices: Rc<RefCell<Vec<String>>>,
+    file: Rc<RefCell<Option<HostFile>>>,
+    handoff: crate::handoff::Handoff<u64>,
+    serial: u64,
+}
+
+impl Hosted {
+    /// The files the host sent: a session bundle opens as the session, an audio file as one track holding one clip.
+    fn open_files(&mut self, app: &mut SoundApp) {
+        for (name, bytes) in std::mem::take(&mut *self.opens.borrow_mut()) {
+            let _ = app.run("transport.stop", serde_json::json!({}));
+            let lower = name.to_ascii_lowercase();
+            let opened = if lower.ends_with(&format!(".{}", io::BUNDLE_EXTENSION)) || lower.ends_with(".scraft") {
+                io::open_session_bytes(&mut app.engine, &name, &bytes).map(|missing| {
+                    if !missing.is_empty() {
+                        app.ui.status = format!("Opened {name} ({} missing media)", missing.len());
+                    }
+                    HostKind::Session
+                })
+            } else {
+                soundcraft_engine::host_open::open_audio_file(&mut app.engine, &name, &bytes)
+                    .map(|f| HostKind::Audio { format: f.format, bit_depth: f.bit_depth })
+            };
+            match opened {
+                Ok(kind) => {
+                    *self.file.borrow_mut() = Some(HostFile { name, kind });
+                    self.serial += 1;
+                }
+                Err(e) => app.ui.status = e.to_string(),
+            }
+        }
+    }
+
+    /// The assistant's runs, each ONE undo step (or none): answered to the host on the session it was asked in.
+    fn run_commands(&self, app: &mut SoundApp) {
+        for run in std::mem::take(&mut *self.runs.borrow_mut()) {
+            let outcome = app.engine.run_command_batch(&run.params);
+            self.bridge.post_result(run.id, outcome);
+        }
+        for notice in std::mem::take(&mut *self.notices.borrow_mut()) {
+            app.ui.status = notice;
+        }
+    }
+}
+
+/// Save, when the host opened the file: write it back under its own name through the host (a new version of it), not a path prompt.
+fn save_through_host(file: Rc<RefCell<Option<HostFile>>>) -> soundcraft_ui_egui::HostRun {
+    Box::new(move |app: &mut SoundApp, id: &str, _params: &serde_json::Value| {
+        if id != "session.save" {
+            return None;
+        }
+        let host = file.borrow().clone()?;
+        let result = match host.kind {
+            HostKind::Session => app.run("session.save", serde_json::json!({ "path": host.name, "replace": true })),
+            HostKind::Audio { format, bit_depth } => {
+                let r = app.run("file.bounce_mix", serde_json::json!({ "path": host.name, "format": format, "bit_depth": bit_depth, "dither": false }));
+                if r.is_ok() {
+                    app.engine.mark_clean();
+                }
+                r
+            }
+        };
+        Some(result)
+    })
 }
 
 impl WebShell {
@@ -193,6 +307,11 @@ impl WebShell {
 
 impl eframe::App for WebShell {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(h) = self.hosted.as_mut() {
+            h.handoff.before(&h.bridge, h.serial);
+            h.open_files(&mut self.app);
+            h.run_commands(&mut self.app);
+        }
         self.take_drops(ctx);
         self.take_path_prompt(ctx);
         let pending = std::mem::take(&mut *self.inbox.borrow_mut());
@@ -206,6 +325,13 @@ impl eframe::App for WebShell {
         self.app.logic(ctx);
         // A prompt opened during this frame becomes a picker on the next one.
         self.take_path_prompt(ctx);
+        if let Some(h) = self.hosted.as_mut() {
+            h.bridge.report_dirty(&self.app, &h.reported);
+            // The first view is a still of the waveform: there is no place in an audio file to put the editor at.
+            if h.handoff.after(&h.bridge, h.serial, |_| {}) {
+                ctx.request_repaint();
+            }
+        }
     }
 
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
