@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 use soundcraft_audio_io::{AudioBuffer, BitDepth, EncodeOptions, FileFormat};
 
 use crate::cmd::find_command;
-use crate::host_commands::{ARGUMENT_COMMANDS, ASSISTANT_COMMANDS, allowed};
+use crate::host_commands::{ARGUMENT_COMMANDS, ASSISTANT_COMMANDS, LEFT_OUT, allowed};
 use crate::host_open::open_audio_file;
 use crate::{Engine, io};
 
@@ -138,4 +138,23 @@ fn a_read_only_run_leaves_no_undo_step() {
     let r = batch(&mut e, "Look", json!([{ "name": "session.inspect", "args": {} }])).unwrap();
     assert_eq!(r["undoStep"], false);
     assert_eq!(e.undo_history().len(), depth);
+}
+
+#[test]
+fn every_registry_command_is_allowed_or_left_out_with_a_reason() {
+    let registry: std::collections::BTreeSet<&str> = crate::command_specs().iter().filter(|s| !s.id.starts_with("test.")).map(|s| s.id).collect();
+    let allowed: std::collections::BTreeSet<&str> = ASSISTANT_COMMANDS.iter().copied().collect();
+    let left: Vec<&str> = LEFT_OUT.iter().flat_map(|(_, ids)| ids.iter().copied()).collect();
+    for (reason, ids) in LEFT_OUT {
+        assert!(reason.len() > 20, "a command left out states why: {ids:?}");
+    }
+    let left_set: std::collections::BTreeSet<&str> = left.iter().copied().collect();
+    assert_eq!(left.len(), left_set.len(), "a command is left out under two reasons");
+    assert!(allowed.is_disjoint(&left_set), "allowed and left out overlap: {:?}", allowed.intersection(&left_set).collect::<Vec<_>>());
+    let accounted: std::collections::BTreeSet<&str> = allowed.union(&left_set).copied().collect();
+    let missing: Vec<&&str> = registry.difference(&accounted).collect();
+    let unknown: Vec<&&str> = accounted.difference(&registry).collect();
+    assert!(missing.is_empty(), "registry commands neither allowed nor left out: {missing:?}");
+    assert!(unknown.is_empty(), "listed commands the registry does not have: {unknown:?}");
+    assert_eq!(registry.len(), allowed.len() + left_set.len());
 }
