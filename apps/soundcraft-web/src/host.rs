@@ -75,7 +75,7 @@ pub struct Bridge {
     version: String,
     opened: Rc<RefCell<Opened>>,
     /// The host's asks for the file's bytes (`craft:export`), judged when heard and answered on the next frame.
-    exports: Rc<RefCell<Vec<u64>>>,
+    exports: Rc<RefCell<Vec<(u64, bool)>>>,
 }
 
 /// The unsaved-changes state last reported to the parent.
@@ -228,7 +228,7 @@ impl Bridge {
                         crate::export::judge(&opened.session, opened.read_only, &asked, request)
                     };
                     match judged {
-                        Ok(request) => bridge.exports.borrow_mut().push(request),
+                        Ok(request) => bridge.exports.borrow_mut().push((request, string(&data, "keep").as_deref() == Some("original"))),
                         Err(why) => log::warn!("Sound: an export ask was not taken: {why:?}"),
                     }
                 }
@@ -284,7 +284,7 @@ impl Bridge {
 
     /// The person saved or bounced `name`: the opened file under its own name is a new version of it, anything else a copy.
     /// The export asks heard since the last frame.
-    pub fn take_exports(&self) -> Vec<u64> {
+    pub fn take_exports(&self) -> Vec<(u64, bool)> {
         std::mem::take(&mut *self.exports.borrow_mut())
     }
 
@@ -295,20 +295,25 @@ impl Bridge {
 
     /// `craft:save {…, checkpoint: request}` to the parent: the answer to its `craft:export`. Never a save of the person's: the
     /// same message a save posts, under the host's own name for the file and so never as a copy.
-    pub fn post_export(&self, bytes: &[u8], request: u64) -> Result<(), String> {
-        let (session, name, base) = {
+    pub fn post_export(&self, name: &str, bytes: &[u8], request: u64, losses: &[String]) -> Result<(), String> {
+        let (session, base) = {
             let opened = self.opened.borrow();
-            (opened.session.clone(), opened.name.clone(), opened.version_id.clone())
+            (opened.session.clone(), opened.version_id.clone())
         };
+        let named = js_sys::Array::new();
+        for l in losses {
+            named.push(&JsValue::from_str(l));
+        }
         let buffer = js_sys::Uint8Array::from(bytes).buffer();
         let m = message(&[
             ("type", "craft:save".into()),
             ("session", session.as_str().into()),
-            ("name", name.as_str().into()),
-            ("mime", mime_of(&name).into()),
+            ("name", name.into()),
+            ("mime", mime_of(name).into()),
             ("baseVersionId", base.as_str().into()),
             ("saveAs", false.into()),
             ("checkpoint", (request as f64).into()),
+            ("losses", named.into()),
             ("bytes", buffer.clone().into()),
         ])
         .ok_or_else(|| "couldn't build the message".to_string())?;

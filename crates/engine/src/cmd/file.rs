@@ -510,6 +510,18 @@ mod tests {
         assert!(crate::io::open_session_bytes(&mut back, "Song.scraftz", &session).unwrap().is_empty(), "the bundle holds its audio");
         assert_eq!(back.session().tracks.len(), e.session().tracks.len());
 
+        // files/044: one clip on one track loses nothing as the audio file; a second track is named, and the bundle beside is the lossless file.
+        assert!(crate::io::host_audio_losses(&e).is_empty(), "{:?}", crate::io::host_audio_losses(&e));
+        let mut two = Engine::default();
+        two.execute("file.import_audio", &json!({"path": wav})).unwrap();
+        two.execute("track.new", &json!({"count": 1, "name": "Second", "format": "mono"})).unwrap();
+        assert_eq!(crate::io::host_audio_losses(&two), vec!["2 separate tracks (an audio file holds one mixed sound)".to_string()]);
+        let (file, bundle) = crate::io::host_session_bundle_for(&two, "take.wav").unwrap();
+        assert_eq!(file, "take.scraftz");
+        let mut reopened = Engine::default();
+        crate::io::open_session_bytes(&mut reopened, &file, &bundle).unwrap();
+        assert_eq!(reopened.session().tracks.len(), 2, "the bundle keeps both tracks");
+
         // The person's Save (a bounce of the file) writes exactly those bytes.
         e.execute("file.bounce_mix", &params).unwrap();
         assert_eq!(std::fs::read(&take).unwrap(), first);

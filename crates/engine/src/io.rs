@@ -1629,6 +1629,29 @@ pub fn host_session_bytes(e: &Engine, name: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// What saving the session back into the AUDIO file the host opened would lose (oneos files/044: auto-save writes only a format that
+/// loses nothing). The file holds one mixed sound: a session of more than one track, or a track of more than one clip, bounces to a
+/// sound that no longer opens as those tracks and clips. Empty: the one clip on the one track is what the file holds.
+pub fn host_audio_losses(e: &Engine) -> Vec<String> {
+    let s = e.session();
+    let mut losses = Vec::new();
+    if s.tracks.len() > 1 {
+        losses.push(format!("{} separate tracks (an audio file holds one mixed sound)", s.tracks.len()));
+    }
+    let clips: usize = s.tracks.iter().map(|t| t.clips().len()).sum();
+    if clips > 1 {
+        losses.push(format!("{clips} separate clips"));
+    }
+    losses
+}
+
+/// The session bundle (`<stem>.scraftz`, every track, clip and source kept) for the host's audio file `name`: the lossless file the
+/// host keeps beside an audio file the session no longer fits in ([`host_audio_losses`]). `e` is only read.
+pub fn host_session_bundle_for(e: &Engine, name: &str) -> Result<(String, Vec<u8>)> {
+    let (file, bytes, _) = bundle_for(e, name)?;
+    Ok((file, bytes))
+}
+
 /// Open a session from bytes (the browser has no paths): a bundle ([`session_bundle`]) or a bare
 /// `.scraft`, whose audio is then reported missing. Returns the missing media, like
 /// [`open_session`].

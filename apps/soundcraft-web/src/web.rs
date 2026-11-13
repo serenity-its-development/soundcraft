@@ -212,21 +212,31 @@ impl Hosted {
     /// The host's asks for the bytes: the file as it stands, as Save writes it back (a session as its bundle, an audio file as the
     /// main mix in its own format and bit depth), with nothing committed, delivered or marked saved.
     fn answer_exports(&self, app: &SoundApp) {
-        for request in self.bridge.take_exports() {
+        for (request, keep_original) in self.bridge.take_exports() {
             let name = self.bridge.opened_name();
             let host = self.file.borrow().clone().filter(|f| f.name == name);
-            let bytes = match host.map(|f| f.kind) {
+            // oneos files/044: an audio file the session no longer fits in (more tracks or clips than one sound) is kept as the
+            // session bundle beside it, the losses named; the audio file itself is written only when the person chose it.
+            let answer = match host.map(|f| f.kind) {
                 None => Err(format!("{name} is not open yet")),
-                Some(HostKind::Session) => io::host_session_bytes(&app.engine, &name).map_err(|e| e.to_string()),
-                Some(HostKind::Audio { format, bit_depth }) => soundcraft_engine::cmd::bounce_bytes(
-                    &app.engine,
-                    &serde_json::json!({ "path": name, "format": format, "bit_depth": bit_depth, "dither": false }),
-                )
-                .map_err(|e| e.to_string()),
+                Some(HostKind::Session) => io::host_session_bytes(&app.engine, &name).map(|b| (name.clone(), b, Vec::new())).map_err(|e| e.to_string()),
+                Some(HostKind::Audio { format, bit_depth }) => {
+                    let losses = io::host_audio_losses(&app.engine);
+                    if keep_original || losses.is_empty() {
+                        soundcraft_engine::cmd::bounce_bytes(
+                            &app.engine,
+                            &serde_json::json!({ "path": name, "format": format, "bit_depth": bit_depth, "dither": false }),
+                        )
+                        .map(|b| (name.clone(), b, losses))
+                        .map_err(|e| e.to_string())
+                    } else {
+                        io::host_session_bundle_for(&app.engine, &name).map(|(n, b)| (n, b, losses)).map_err(|e| e.to_string())
+                    }
+                }
             };
-            match bytes {
-                Ok(bytes) => {
-                    if let Err(e) = self.bridge.post_export(&bytes, request) {
+            match answer {
+                Ok((as_name, bytes, losses)) => {
+                    if let Err(e) = self.bridge.post_export(&as_name, &bytes, request, &losses) {
                         log::warn!("Sound: the export could not be handed to the host: {e}");
                     }
                 }
@@ -234,6 +244,7 @@ impl Hosted {
             }
         }
     }
+
 }
 
 /// Save, when the host opened the file: write it back under its own name through the host (a new version of it), not a path prompt.
