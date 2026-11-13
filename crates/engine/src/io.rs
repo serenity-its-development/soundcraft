@@ -445,6 +445,10 @@ pub struct Bounce {
     peak: f32,
     meter: soundcraft_dsp::meter::LoudnessMeter,
     enc: Option<soundcraft_audio_io::FileEncoder<Out>>,
+    /// Rendered into memory and kept, never written or delivered ([`Bounce::in_memory`]).
+    keep: bool,
+    /// The finished file of a bounce that keeps it.
+    kept: Option<Vec<u8>>,
 }
 
 /// A finished bounce: the size of its file and its levels.
@@ -469,21 +473,54 @@ impl Bounce {
         normalize: bool,
         fold_stereo: bool,
     ) -> Result<Bounce> {
+        Self::start(s, path, r, opts, bus, normalize, fold_stereo, false)
+    }
+
+    /// [`Bounce::new`] rendered into memory and kept: nothing is written to `path` or delivered, and [`Bounce::into_bytes`] gives
+    /// the file's bytes (the OneOS host's ask for an export of an audio file: the bytes Save would write).
+    pub fn in_memory(
+        s: Arc<Session>,
+        path: &Path,
+        r: Range,
+        opts: &EncodeOptions,
+        bus: Option<BusId>,
+        normalize: bool,
+        fold_stereo: bool,
+    ) -> Result<Bounce> {
+        Self::start(s, path, r, opts, bus, normalize, fold_stereo, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        s: Arc<Session>,
+        path: &Path,
+        r: Range,
+        opts: &EncodeOptions,
+        bus: Option<BusId>,
+        normalize: bool,
+        fold_stereo: bool,
+        keep: bool,
+    ) -> Result<Bounce> {
         if r.len() > s.sample_rate.samples(MAX_BOUNCE_SECS) {
             return Err(EngineError::BadParams("file.bounce_mix".into(), "bounces are limited to 4 hours".into()));
         }
         let (fmt, channels, fold) = bounce_layout(&s, bus, fold_stereo);
         let name = path.file_name().map_or_else(|| "bounce".into(), |n| n.to_string_lossy().into_owned());
         let part = path.with_file_name(format!("{name}.part"));
-        crate::file_access::check_write(path).map_err(EngineError::Io)?;
-        crate::file_access::check_write(&part).map_err(EngineError::Io)?;
+        if !keep {
+            crate::file_access::check_write(path).map_err(EngineError::Io)?;
+            crate::file_access::check_write(&part).map_err(EngineError::Io)?;
+        }
         let enc = (|| -> std::result::Result<_, soundcraft_audio_io::AudioError> {
-            let enc = soundcraft_audio_io::FileEncoder::new(Out::create(&part)?, opts, channels, s.sample_rate.hz(), Some(fmt.channel_mask()))?;
+            let out = if keep { Out::Memory(std::io::Cursor::new(Vec::new())) } else { Out::create(&part)? };
+            let enc = soundcraft_audio_io::FileEncoder::new(out, opts, channels, s.sample_rate.hz(), Some(fmt.channel_mask()))?;
             enc.check_room(u64::try_from(r.len()).unwrap_or(0))?;
             Ok(enc)
         })()
         .map_err(|err| {
-            let _ = std::fs::remove_file(&part);
+            if !keep {
+                let _ = std::fs::remove_file(&part);
+            }
             EngineError::Io(format!("{}: {err}", path.display()))
         })?;
         let render = soundcraft_mix::RangeRender::new(&s, bus, r, 1024);
@@ -504,6 +541,8 @@ impl Bounce {
             peak: 0.0,
             meter,
             enc: Some(enc),
+            keep,
+            kept: None,
         })
     }
 
@@ -565,9 +604,29 @@ impl Bounce {
         }
     }
 
+    /// Renders the whole bounce kept in memory ([`Bounce::in_memory`]) and returns its file's bytes.
+    pub fn into_bytes(mut self) -> Result<Vec<u8>> {
+        if !self.keep {
+            return Err(EngineError::Io(format!("{}: this bounce is written, not kept", self.path.display())));
+        }
+        loop {
+            if self.step(|| true)?.is_some() {
+                return self.kept.take().ok_or_else(|| EngineError::Io(format!("{}: the bounce kept nothing", self.path.display())));
+            }
+        }
+    }
+
     fn finish(&mut self) -> Result<Bounced> {
         let bytes = match self.enc.take() {
-            Some(enc) => enc.finish().map_err(|err| EngineError::Io(format!("{}: {err}", self.path.display())))?.complete(&self.part, &self.path)?,
+            Some(enc) => match enc.finish().map_err(|err| EngineError::Io(format!("{}: {err}", self.path.display())))? {
+                Out::Memory(m) if self.keep => {
+                    let kept = m.into_inner();
+                    let len = kept.len() as u64;
+                    self.kept = Some(kept);
+                    len
+                }
+                out => out.complete(&self.part, &self.path)?,
+            },
             None => 0,
         };
         Ok(Bounced {
@@ -583,7 +642,9 @@ impl Drop for Bounce {
     /// Removes the part file unless the bounce completed (which renamed it).
     fn drop(&mut self) {
         drop(self.enc.take());
-        let _ = std::fs::remove_file(&self.part);
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.part);
+        }
     }
 }
 
@@ -1534,6 +1595,18 @@ fn session_bundle_within(session: &Session, limits: BundleLimits) -> Result<(Vec
 
 /// Save as a bundle named after `path`'s file name, delivered through the host ([`write_file`]).
 fn save_session_bundle(e: &mut Engine, path: &str) -> Result<usize> {
+    let (file, bytes, fresh) = bundle_for(e, path)?;
+    write_file(&file, &bytes)?;
+    let written = fresh.sources.iter().filter(|x| fresh.pool.get(x.id).is_some()).count();
+    *e.session_mut() = fresh;
+    e.path = Some(file);
+    e.mark_clean();
+    Ok(written)
+}
+
+/// The bundle Save writes for `path` (see [`save_session_bundle`]): its file name, its bytes and the session it holds. `e` is only
+/// read.
+fn bundle_for(e: &Engine, path: &str) -> Result<(String, Vec<u8>, Session)> {
     let stem = Path::new(path).file_stem().and_then(OsStr::to_str).filter(|x| !x.is_empty()).map(str::to_string);
     let mut s = e.session().clone();
     if let Some(stem) = stem {
@@ -1541,12 +1614,19 @@ fn save_session_bundle(e: &mut Engine, path: &str) -> Result<usize> {
     }
     let (bytes, fresh) = session_bundle(&s)?;
     let file = format!("{}.{BUNDLE_EXTENSION}", sanitize_name(&fresh.name));
-    write_file(&file, &bytes)?;
-    let written = fresh.sources.iter().filter(|x| fresh.pool.get(x.id).is_some()).count();
-    *e.session_mut() = fresh;
-    e.path = Some(file);
-    e.mark_clean();
-    Ok(written)
+    Ok((file, bytes, fresh))
+}
+
+/// The bytes the browser's Save would hand the host for the session it opened as `name`, as the session stands: the answer to
+/// the OneOS host's ask for an export (auto-save, save on close). Nothing here is a save: the engine is only read, so the session
+/// keeps its unsaved changes and its path, and nothing is delivered. Refused when Save would write the bundle under another name
+/// than `name` (a bare `.scraft` the host opened saves as a `.scraftz` bundle beside it, a copy): an export is never a copy.
+pub fn host_session_bytes(e: &Engine, name: &str) -> Result<Vec<u8>> {
+    let (file, bytes, _) = bundle_for(e, name)?;
+    if file != name {
+        return Err(EngineError::Io(format!("{name}: Save writes it as {file}, not under its own name")));
+    }
+    Ok(bytes)
 }
 
 /// Open a session from bytes (the browser has no paths): a bundle ([`session_bundle`]) or a bare

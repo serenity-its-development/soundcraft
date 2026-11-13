@@ -308,6 +308,16 @@ fn bounce(e: &mut Engine, p: &Value) -> Result<Value> {
 
 /// The bounce `file.bounce_mix` runs for `p`, not rendered yet.
 pub fn bounce_job(e: &Engine, p: &Value) -> Result<crate::io::Bounce> {
+    bounce_job_kept(e, p, false)
+}
+
+/// The bytes `file.bounce_mix` writes for `p`, as the session stands, rendered into memory: nothing is written or delivered, and
+/// the engine is only read (the OneOS host's ask for an export of an audio file it opened: the bytes its Save would write).
+pub fn bounce_bytes(e: &Engine, p: &Value) -> Result<Vec<u8>> {
+    bounce_job_kept(e, p, true)?.into_bytes()
+}
+
+fn bounce_job_kept(e: &Engine, p: &Value, keep: bool) -> Result<crate::io::Bounce> {
     let path = str_param(p, "path").ok_or_else(|| bad("file.bounce_mix", "`path` required"))?.to_string();
     let r = range_param(e, "file.bounce_mix", p)?;
     let r = if r.is_empty() { soundcraft_time::Range::new(0, e.session().content_end().max(1)) } else { r };
@@ -325,7 +335,12 @@ pub fn bounce_job(e: &Engine, p: &Value) -> Result<crate::io::Bounce> {
     let normalize = bool_or(p, "normalize", false);
     let fold = fold_down_param(p, "file.bounce_mix")?;
     let bus = bounce_bus(e, p)?;
-    crate::io::Bounce::new(e.session_arc(), std::path::Path::new(&path), r, &opts, bus, normalize, fold)
+    let path = std::path::Path::new(&path);
+    if keep {
+        crate::io::Bounce::in_memory(e.session_arc(), path, r, &opts, bus, normalize, fold)
+    } else {
+        crate::io::Bounce::new(e.session_arc(), path, r, &opts, bus, normalize, fold)
+    }
 }
 
 /// Write the score of the chosen MIDI tracks as MusicXML (or SVG when `svg`).
@@ -466,6 +481,39 @@ mod tests {
         assert_eq!(e.session().tracks[0].format, ChannelFormat::Mono);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The OneOS host's ask for the bytes (`craft:export`: auto-save, save on close) is never a save: an audio file's bytes are
+    /// what Save's bounce writes and a session's are the bundle Save hands the host, and the engine is as it was (unsaved, same
+    /// path, nothing written).
+    #[test]
+    fn an_export_for_the_host_is_the_bytes_of_a_save_and_leaves_the_session_unsaved() {
+        let dir = std::env::temp_dir().join(format!("sc-host-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = tone_wav(&dir, "tone.wav");
+        let mut e = Engine::default();
+        e.execute("file.import_audio", &json!({"path": wav})).unwrap();
+        assert!(e.is_dirty());
+        let (path, undo) = (e.path.clone(), e.undo_history().len());
+
+        let take = dir.join("take.wav");
+        let params = json!({"path": take.to_string_lossy(), "format": "wav", "bit_depth": "24", "dither": false});
+        let first = bounce_bytes(&e, &params).unwrap();
+        assert_eq!(first, bounce_bytes(&e, &params).unwrap(), "asked twice, the same bytes");
+        assert!(!take.exists() && !dir.join("take.wav.part").exists(), "nothing was written");
+        let session = crate::io::host_session_bytes(&e, "Song.scraftz").unwrap();
+        assert!(crate::io::host_session_bytes(&e, "Song.scraft").is_err(), "Save writes a bare session as a bundle: a copy, never exported");
+        assert!(e.is_dirty() && e.path == path && e.undo_history().len() == undo, "an export is not a save");
+
+        let mut back = Engine::default();
+        assert!(crate::io::open_session_bytes(&mut back, "Song.scraftz", &session).unwrap().is_empty(), "the bundle holds its audio");
+        assert_eq!(back.session().tracks.len(), e.session().tracks.len());
+
+        // The person's Save (a bounce of the file) writes exactly those bytes.
+        e.execute("file.bounce_mix", &params).unwrap();
+        assert_eq!(std::fs::read(&take).unwrap(), first);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

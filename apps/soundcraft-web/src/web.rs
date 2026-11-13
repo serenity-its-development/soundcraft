@@ -208,6 +208,32 @@ impl Hosted {
             app.ui.status = notice;
         }
     }
+
+    /// The host's asks for the bytes: the file as it stands, as Save writes it back (a session as its bundle, an audio file as the
+    /// main mix in its own format and bit depth), with nothing committed, delivered or marked saved.
+    fn answer_exports(&self, app: &SoundApp) {
+        for request in self.bridge.take_exports() {
+            let name = self.bridge.opened_name();
+            let host = self.file.borrow().clone().filter(|f| f.name == name);
+            let bytes = match host.map(|f| f.kind) {
+                None => Err(format!("{name} is not open yet")),
+                Some(HostKind::Session) => io::host_session_bytes(&app.engine, &name).map_err(|e| e.to_string()),
+                Some(HostKind::Audio { format, bit_depth }) => soundcraft_engine::cmd::bounce_bytes(
+                    &app.engine,
+                    &serde_json::json!({ "path": name, "format": format, "bit_depth": bit_depth, "dither": false }),
+                )
+                .map_err(|e| e.to_string()),
+            };
+            match bytes {
+                Ok(bytes) => {
+                    if let Err(e) = self.bridge.post_export(&bytes, request) {
+                        log::warn!("Sound: the export could not be handed to the host: {e}");
+                    }
+                }
+                Err(e) => log::warn!("Sound: {name} was not exported: {e}"),
+            }
+        }
+    }
 }
 
 /// Save, when the host opened the file: write it back under its own name through the host (a new version of it), not a path prompt.
@@ -311,6 +337,7 @@ impl eframe::App for WebShell {
             h.handoff.before(&h.bridge, h.serial);
             h.open_files(&mut self.app);
             h.run_commands(&mut self.app);
+            h.answer_exports(&self.app);
         }
         self.take_drops(ctx);
         self.take_path_prompt(ctx);

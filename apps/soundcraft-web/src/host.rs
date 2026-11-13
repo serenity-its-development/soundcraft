@@ -7,6 +7,8 @@
 //!
 //! - `craft:ready {app, version}` (to the parent): listening; send the file now.
 //! - `craft:open {session, name, mime, bytes, versionId, readOnly, collab}` (from the parent): open these bytes (a WAV, AIFF or FLAC file, or a Sound session bundle `.scraftz`).
+//! - `craft:export {session, request}` (from the parent): the host asks for the file's bytes as they stand; answered by
+//!   `craft:save {…, checkpoint: request}` (`export.rs`). Never a save of the person's: nothing is committed or marked saved.
 //! - `craft:save {session, name, mime, bytes, baseVersionId, saveAs}` (to the parent): the person saved. The bytes are a
 //!   transferred `ArrayBuffer`; the host makes a NEW version of the file through the compare-and-set and answers
 //!   `craft:saved {session, versionId}` (the next save's base) or `craft:refused {session, code, reason}`. Anything that is not the
@@ -72,6 +74,8 @@ pub struct Bridge {
     app: String,
     version: String,
     opened: Rc<RefCell<Opened>>,
+    /// The host's asks for the file's bytes (`craft:export`), judged when heard and answered on the next frame.
+    exports: Rc<RefCell<Vec<u64>>>,
 }
 
 /// The unsaved-changes state last reported to the parent.
@@ -102,6 +106,7 @@ impl Bridge {
             app: string(&declared, "app").unwrap_or_else(|| "sound".into()),
             version: string(&declared, "version").unwrap_or_else(|| env!("CARGO_PKG_VERSION").into()),
             opened: Rc::default(),
+            exports: Rc::default(),
         })
     }
 
@@ -193,6 +198,8 @@ impl Bridge {
                         version_id: string(&data, "versionId").unwrap_or_default(),
                         read_only: boolean(&data, "readOnly"),
                     };
+                    // An ask not yet answered was for the open this one replaces.
+                    bridge.exports.borrow_mut().clear();
                     opens.borrow_mut().push((name, array.to_vec()));
                     crate::handoff::wasm::note_open();
                 }
@@ -210,6 +217,19 @@ impl Bridge {
                     if string(&data, "session").as_deref() == Some(bridge.opened.borrow().session.as_str()) {
                         let reason = string(&data, "reason").unwrap_or_else(|| "refused".into());
                         notices.borrow_mut().push(format!("Couldn't save: {reason}"));
+                    }
+                }
+                // The host asks for the bytes as they stand (auto-save, save on close): answered on the next frame (`export.rs`).
+                "craft:export" => {
+                    let asked = string(&data, "session").unwrap_or_default();
+                    let request = js_sys::Reflect::get(&data, &JsValue::from_str("request")).ok().and_then(|v| v.as_f64());
+                    let judged = {
+                        let opened = bridge.opened.borrow();
+                        crate::export::judge(&opened.session, opened.read_only, &asked, request)
+                    };
+                    match judged {
+                        Ok(request) => bridge.exports.borrow_mut().push(request),
+                        Err(why) => log::warn!("Sound: an export ask was not taken: {why:?}"),
                     }
                 }
                 "craft:command" => {
@@ -263,6 +283,38 @@ impl Bridge {
     }
 
     /// The person saved or bounced `name`: the opened file under its own name is a new version of it, anything else a copy.
+    /// The export asks heard since the last frame.
+    pub fn take_exports(&self) -> Vec<u64> {
+        std::mem::take(&mut *self.exports.borrow_mut())
+    }
+
+    /// The host's file name for the open this frame holds (an export is always the opened file, never a copy).
+    pub fn opened_name(&self) -> String {
+        self.opened.borrow().name.clone()
+    }
+
+    /// `craft:save {…, checkpoint: request}` to the parent: the answer to its `craft:export`. Never a save of the person's: the
+    /// same message a save posts, under the host's own name for the file and so never as a copy.
+    pub fn post_export(&self, bytes: &[u8], request: u64) -> Result<(), String> {
+        let (session, name, base) = {
+            let opened = self.opened.borrow();
+            (opened.session.clone(), opened.name.clone(), opened.version_id.clone())
+        };
+        let buffer = js_sys::Uint8Array::from(bytes).buffer();
+        let m = message(&[
+            ("type", "craft:save".into()),
+            ("session", session.as_str().into()),
+            ("name", name.as_str().into()),
+            ("mime", mime_of(&name).into()),
+            ("baseVersionId", base.as_str().into()),
+            ("saveAs", false.into()),
+            ("checkpoint", (request as f64).into()),
+            ("bytes", buffer.clone().into()),
+        ])
+        .ok_or_else(|| "couldn't build the message".to_string())?;
+        self.post(&m, Some(&buffer))
+    }
+
     pub fn post_save(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
         let mime = mime_of(name);
         let (session, base, as_copy) = {
